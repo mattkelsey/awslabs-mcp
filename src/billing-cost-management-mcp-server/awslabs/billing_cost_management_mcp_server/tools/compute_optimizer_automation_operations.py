@@ -19,6 +19,9 @@ Automation tool. Each operation handles the AWS API call and response formatting
 """
 
 import asyncio
+import base64
+import binascii
+import json
 from ..utilities.aws_service_base import (
     create_aws_client,
     format_response,
@@ -60,6 +63,7 @@ COMPUTE_OPTIMIZER_AUTOMATION_REGIONS = [
 
 # Cap on regions queried concurrently during a global fan-out.
 _MAX_CONCURRENT_REGIONS = 8
+_SERVICE_NAME = 'Compute Optimizer Automation'
 
 
 # ===== Formatting helpers =====
@@ -1156,6 +1160,83 @@ async def list_tags_for_resource(
 # ===== Multi-region fan-out =====
 
 
+def _encode_global_next_token(region_next_tokens: Dict[str, str]) -> str:
+    """Encode per-region pagination state as one opaque tool token."""
+    payload = json.dumps(region_next_tokens, separators=(',', ':'), sort_keys=True)
+    return base64.b64encode(payload.encode('utf-8')).decode('ascii')
+
+
+def _parse_global_next_token(
+    next_token: Optional[str],
+) -> Tuple[Dict[str, Optional[str]], Optional[Dict[str, Any]]]:
+    """Resolve a global token into the regions and AWS tokens to resume.
+
+    Global pagination state is an opaque base64-encoded JSON object. Callers must
+    return the token unchanged; the regional map is an implementation detail.
+    """
+    if not next_token:
+        return dict.fromkeys(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS), None
+
+    try:
+        decoded = base64.b64decode(next_token.encode('ascii'), validate=True).decode('utf-8')
+        parsed = json.loads(decoded)
+    except (UnicodeEncodeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as e:
+        return {}, format_response(
+            'error',
+            {
+                'parameter': 'next_token',
+                'supported_regions': COMPUTE_OPTIMIZER_AUTOMATION_REGIONS,
+            },
+            'Invalid global next_token. If this token came from a global response, pass '
+            'it back unchanged. If it came from an explicit-region query, pass `region` '
+            f'along with it. Decode error: {e}',
+        )
+
+    if not isinstance(parsed, dict):
+        return {}, format_response(
+            'error',
+            {'parameter': 'next_token'},
+            'Invalid global next_token: decoded pagination state must be a non-empty '
+            'region-to-token map. Pass the previous global response next_token unchanged.',
+        )
+    if not parsed:
+        return {}, format_response(
+            'error',
+            {'parameter': 'next_token'},
+            'Invalid global next_token: the regional pagination map is empty. Start a new '
+            'global query by omitting next_token.',
+        )
+
+    invalid_tokens = sorted(
+        region
+        for region, token in parsed.items()
+        if not isinstance(region, str) or not isinstance(token, str) or not token.strip()
+    )
+    if invalid_tokens:
+        return {}, format_response(
+            'error',
+            {'parameter': 'next_token', 'invalid_regions': invalid_tokens},
+            'Invalid global next_token: every regional token must be a non-empty string. '
+            'Pass the previous global response next_token unchanged.',
+        )
+
+    unknown_regions = sorted(set(parsed) - set(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS))
+    if unknown_regions:
+        return {}, format_response(
+            'error',
+            {
+                'parameter': 'next_token',
+                'unsupported_regions': unknown_regions,
+                'supported_regions': COMPUTE_OPTIMIZER_AUTOMATION_REGIONS,
+            },
+            'Invalid global next_token: it contains unsupported region key(s): '
+            f'{", ".join(unknown_regions)}. Pass the previous global response next_token '
+            'unchanged.',
+        )
+
+    return dict(parsed), None
+
+
 def _is_resource_not_found(error: Exception) -> bool:
     """Return True if the error is a Compute Optimizer Automation not-found error.
 
@@ -1167,6 +1248,23 @@ def _is_resource_not_found(error: Exception) -> bool:
         if response.get('Error', {}).get('Code') == 'ResourceNotFoundException':
             return True
     return type(error).__name__ == 'ResourceNotFoundException'
+
+
+async def _format_region_error(
+    ctx: Context, error: Exception, operation: str
+) -> Dict[str, Any]:
+    """Classify a regional failure using the shared AWS error handler."""
+    classified = await handle_aws_error(ctx, error, operation, _SERVICE_NAME)
+    useful_fields = (
+        'error_type',
+        'message',
+        'request_id',
+        'http_status',
+        'boto_error_type',
+        'exception_type',
+        'details',
+    )
+    return {field: classified[field] for field in useful_fields if field in classified}
 
 
 async def run_global_list(
@@ -1195,25 +1293,32 @@ async def run_global_list(
 
     Returns:
         A format_response dict with the merged items (or the SQL offload sentinel),
-        the regions queried, any per-region leftover tokens, and any per-region errors.
-        If every region errored, an error response with the per-region errors.
+        the regions queried, an opaque leftover token, and any typed per-region errors.
+        If no region could be searched, an error response with the per-region outcomes.
     """
     semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REGIONS)
 
     async def query_region(
         region: str, token: Optional[str]
-    ) -> Tuple[str, List[Dict[str, Any]], Optional[str], Optional[str]]:
+    ) -> Tuple[
+        str,
+        List[Dict[str, Any]],
+        Optional[str],
+        Optional[Dict[str, Any]],
+        bool,
+    ]:
         async with semaphore:
             try:
                 client = await asyncio.to_thread(
                     create_compute_optimizer_automation_client, region
                 )
                 items, leftover = await collect(client, token)
-                return region, items, leftover, None
+                return region, items, leftover, None, False
             except Exception as e:
                 if not_found_is_empty and _is_resource_not_found(e):
-                    return region, [], None, None
-                return region, [], None, str(e)
+                    return region, [], None, None, True
+                error = await _format_region_error(ctx, e, operation)
+                return region, [], None, error, False
 
     results = await asyncio.gather(
         *(query_region(region, token) for region, token in regions_tokens.items())
@@ -1221,29 +1326,58 @@ async def run_global_list(
 
     merged: List[Dict[str, Any]] = []
     region_next_tokens: Dict[str, str] = {}
-    region_errors: Dict[str, str] = {}
-    for region, items, leftover, error in results:
+    region_errors: Dict[str, Dict[str, Any]] = {}
+    regions_not_found: List[str] = []
+    successful_regions = 0
+    for region, items, leftover, error, not_found in results:
+        if not_found:
+            regions_not_found.append(region)
+            continue
         if error is not None:
             region_errors[region] = error
             continue
+        successful_regions += 1
         for item in items:
             # Events and recommended actions already carry the resource's region;
             # summaries and steps do not, so stamp the queried region on them.
-            if 'region' not in item:
+            if not item.get('region'):
                 item['region'] = region
             merged.append(item)
         if leftover:
             region_next_tokens[region] = leftover
 
-    if region_errors and len(region_errors) == len(regions_tokens):
+    if not_found_is_empty and regions_not_found and not region_errors and not successful_regions:
         return format_response(
             'error',
             {
                 'operation': operation,
                 'regions_queried': list(regions_tokens),
-                'region_errors': region_errors,
+                'regions_not_found': regions_not_found,
             },
-            f'All {len(region_errors)} region(s) failed for {operation}.',
+            f'The requested resource was not found in any of the {len(regions_not_found)} '
+            f'region(s) queried for {operation}.',
+        )
+
+    if region_errors and not successful_regions:
+        data: Dict[str, Any] = {
+            'operation': operation,
+            'regions_queried': list(regions_tokens),
+            'region_errors': region_errors,
+        }
+        if regions_not_found:
+            data['regions_not_found'] = regions_not_found
+        if regions_not_found:
+            message = (
+                f'Could not determine whether the requested resource exists for {operation}: '
+                f'{len(region_errors)} region(s) failed and {len(regions_not_found)} returned '
+                'not found.'
+            )
+        else:
+            message = f'All {len(region_errors)} region(s) failed for {operation}.'
+        return format_response(
+            'error',
+            data,
+            message,
         )
 
     return await _finalize_global_list_response(
@@ -1264,13 +1398,13 @@ async def _finalize_global_list_response(
     items: List[Dict[str, Any]],
     regions_queried: List[str],
     region_next_tokens: Dict[str, str],
-    region_errors: Dict[str, str],
+    region_errors: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Build a merged multi-region list response, offloading to SQL when large.
 
     Mirrors _finalize_list_response for the global fan-out. The item list is stored
     first so the SQL records converter extracts it (regions_queried is also a list),
-    and the per-region token and error maps are passed as metadata so they survive
+    and the opaque token and typed error map are passed as metadata so they survive
     an offload.
 
     Args:
@@ -1280,21 +1414,25 @@ async def _finalize_global_list_response(
         items: The merged, region-annotated items.
         regions_queried: The regions that were queried.
         region_next_tokens: Map of region -> leftover token for regions with more data.
-        region_errors: Map of region -> error message for regions that failed.
+        region_errors: Map of region -> structured error for regions that failed.
 
     Returns:
         A format_response dict — either the inline merged list or the SQL offload sentinel.
     """
     response_data: Dict[str, Any] = {list_key: items, 'count': len(items)}
     response_data['regions_queried'] = regions_queried
+    global_next_token = None
     if region_next_tokens:
-        response_data['region_next_tokens'] = region_next_tokens
+        global_next_token = _encode_global_next_token(region_next_tokens)
+        response_data['next_token'] = global_next_token
     if region_errors:
         response_data['region_errors'] = region_errors
 
     offload_metadata: Dict[str, Any] = {'regions_queried': regions_queried}
-    if region_next_tokens:
-        offload_metadata['region_next_tokens'] = region_next_tokens
+    if global_next_token:
+        # Keep the public key stable even when the generic SQL converter also
+        # derives its next_page_token pagination envelope.
+        offload_metadata['next_token'] = global_next_token
     if region_errors:
         offload_metadata['region_errors'] = region_errors
 
@@ -1328,26 +1466,36 @@ async def get_automation_event_global(ctx: Context, event_id: str) -> Dict[str, 
 
     async def lookup(
         region: str,
-    ) -> Tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+    ) -> Tuple[
+        str,
+        Optional[Dict[str, Any]],
+        Optional[Dict[str, Any]],
+        bool,
+    ]:
         async with semaphore:
             try:
                 client = await asyncio.to_thread(
                     create_compute_optimizer_automation_client, region
                 )
                 response = await asyncio.to_thread(client.get_automation_event, eventId=event_id)
-                return region, response, None
+                return region, response, None, False
             except Exception as e:
                 if _is_resource_not_found(e):
-                    return region, None, None
-                return region, None, str(e)
+                    return region, None, None, True
+                error = await _format_region_error(ctx, e, 'get_automation_event')
+                return region, None, error, False
 
     await ctx.info(f'Searching all Automation regions for automation event {event_id}')
     results = await asyncio.gather(
         *(lookup(region) for region in COMPUTE_OPTIMIZER_AUTOMATION_REGIONS)
     )
 
-    region_errors: Dict[str, str] = {}
-    for region, response, error in results:
+    region_errors: Dict[str, Dict[str, Any]] = {}
+    regions_not_found: List[str] = []
+    for region, response, error, not_found in results:
+        if not_found:
+            regions_not_found.append(region)
+            continue
         if error is not None:
             region_errors[region] = error
         elif response is not None:
@@ -1363,6 +1511,14 @@ async def get_automation_event_global(ctx: Context, event_id: str) -> Dict[str, 
     }
     if region_errors:
         data['region_errors'] = region_errors
+        data['regions_not_found'] = regions_not_found
+        return format_response(
+            'error',
+            data,
+            f'Could not determine whether automation event {event_id} exists because '
+            f'{len(region_errors)} of {len(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS)} region(s) '
+            'could not be searched. Review region_errors and retry.',
+        )
     return format_response(
         'error', data, f'Automation event {event_id} was not found in any region.'
     )
@@ -1451,6 +1607,8 @@ def create_compute_optimizer_automation_client(region: Optional[str] = None) -> 
 # Re-export for tools module to catch broad errors uniformly.
 __all__ = [
     'COMPUTE_OPTIMIZER_AUTOMATION_REGIONS',
+    '_encode_global_next_token',
+    '_parse_global_next_token',
     'create_compute_optimizer_automation_client',
     'get_automation_event',
     'get_automation_event_global',

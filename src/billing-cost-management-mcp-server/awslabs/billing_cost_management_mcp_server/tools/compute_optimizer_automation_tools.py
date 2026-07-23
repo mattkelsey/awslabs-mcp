@@ -28,10 +28,8 @@ results. Pass a `region` to target a single region.
 """
 
 import botocore.session
-import json
 from ..utilities.aws_service_base import format_response, handle_aws_error, parse_json
 from .compute_optimizer_automation_operations import (
-    COMPUTE_OPTIMIZER_AUTOMATION_REGIONS,
     _collect_automation_event_steps,
     _collect_automation_event_summaries,
     _collect_automation_events,
@@ -39,6 +37,7 @@ from .compute_optimizer_automation_operations import (
     _collect_automation_rule_preview_summaries,
     _collect_recommended_action_summaries,
     _collect_recommended_actions,
+    _parse_global_next_token,
     create_compute_optimizer_automation_client,
     get_automation_event,
     get_automation_event_global,
@@ -59,7 +58,7 @@ from .compute_optimizer_automation_operations import (
 from botocore import xform_name
 from fastmcp import Context, FastMCP
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 _SERVICE_NAME = 'Compute Optimizer Automation'
@@ -93,50 +92,6 @@ _SINGLE_REGION_OPERATIONS = {
     'get_enrollment_configuration',
     'list_accounts',
 }
-
-
-def _parse_global_next_token(
-    next_token: Optional[str],
-) -> Tuple[Dict[str, Optional[str]], Optional[Dict[str, Any]]]:
-    """Resolve the next_token for a global query into a region -> start-token map.
-
-    Returns (regions_tokens, error_response). On success error_response is None; on
-    failure error_response is set and regions_tokens is empty (callers check the error).
-
-    - No token: query every Automation region from the first page.
-    - A JSON object (the `region_next_tokens` map from a prior global response):
-      resume only those regions.
-    - A plain token: rejected — a bare token belongs to a single region, so the
-      caller must either pass an explicit `region` or the region_next_tokens map.
-    """
-    if not next_token:
-        return dict.fromkeys(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS), None
-
-    if next_token.strip().startswith('{'):
-        try:
-            parsed = json.loads(next_token)
-        except (json.JSONDecodeError, ValueError) as e:
-            return {}, format_response(
-                'error',
-                {'next_token': next_token},
-                f'Invalid region_next_tokens map: {e}',
-            )
-        if not isinstance(parsed, dict) or not all(
-            isinstance(value, str) for value in parsed.values()
-        ):
-            return {}, format_response(
-                'error',
-                {'next_token': next_token},
-                'region_next_tokens must be a JSON object mapping region to a string token.',
-            )
-        return dict(parsed), None
-
-    return {}, format_response(
-        'error',
-        {'next_token': next_token},
-        'A plain next_token is only valid with an explicit `region`. To resume a '
-        'global query, pass the `region_next_tokens` map from the previous response.',
-    )
 
 
 @lru_cache(maxsize=1)
@@ -259,11 +214,10 @@ Valid filter names by operation:
 
 List operations paginate automatically up to max_pages (default 10, applied per region in
 global mode). The returned `count` is the number of items in this response, not a grand
-total. In single-region mode a leftover `next_token` is a plain string; pass it back to
-continue. In global mode more results are reported as a `region_next_tokens` map
-({region: token}); pass that whole map back as `next_token` to resume only those regions.
-A global response may also include `region_errors` ({region: message}) for regions that
-failed while others succeeded.
+total. When more results remain, pass the returned opaque `next_token` string back
+unchanged. Tokens from global and explicit-region queries are not interchangeable.
+A global response may also include `region_errors` ({region: structured error}) for
+regions that failed while others succeeded.
 
 Examples:
 - {"operation": "get_enrollment_configuration"}
@@ -315,8 +269,8 @@ async def compute_optimizer_automation(
         max_pages: Maximum number of API pages to fetch (list operations). Defaults to 10.
             Applied per region in global mode.
         next_token: Optional pagination token from a previous response (list operations).
-            In single-region mode this is a plain token; in global mode pass back the
-            `region_next_tokens` map (JSON object) from the previous response.
+            Pass the opaque string from the previous response back unchanged. Global
+            tokens and explicit-region tokens are not interchangeable.
 
     Returns:
         Dict containing the requested Compute Optimizer Automation data.
@@ -363,14 +317,18 @@ async def compute_optimizer_automation(
             )
 
         # Single-region path: an explicit region, or an account-global operation.
-        # A region_next_tokens map only applies to a global query.
-        if next_token and next_token.strip().startswith('{'):
-            return format_response(
-                'error',
-                {'operation': operation, 'next_token': next_token},
-                'A region_next_tokens map is only valid for a global query (no region). '
-                "With an explicit region, pass that region's plain next_token.",
-            )
+        # Catch the actionable cross-mode mistake locally instead of sending an
+        # encoded regional map to AWS as though it were a native service token.
+        if next_token:
+            _, global_token_error = _parse_global_next_token(next_token)
+            if global_token_error is None:
+                return format_response(
+                    'error',
+                    {'operation': operation, 'parameter': 'next_token'},
+                    'A global next_token is only valid when region is omitted. With an '
+                    'explicit region, pass the next_token returned by that same '
+                    'explicit-region query.',
+                )
 
         client = create_compute_optimizer_automation_client(region)
 
@@ -481,7 +439,7 @@ async def _dispatch_global(
         criteria: Optional JSON string of rule criteria (preview operations).
         max_results: Optional maximum number of results per page.
         max_pages: Maximum number of API pages to fetch per region. Defaults to 10.
-        next_token: Optional region_next_tokens map (JSON) to resume specific regions.
+        next_token: Optional opaque global token to resume regions with more pages.
 
     Returns:
         The merged multi-region response, or an error response.
