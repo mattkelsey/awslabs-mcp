@@ -29,32 +29,16 @@ results. Pass a `region` to target a single region.
 
 import botocore.session
 from ..utilities.aws_service_base import format_response, handle_aws_error, parse_json
-from .compute_optimizer_automation_operations import (
-    _collect_automation_event_steps,
-    _collect_automation_event_summaries,
-    _collect_automation_events,
-    _collect_automation_rule_preview,
-    _collect_automation_rule_preview_summaries,
-    _collect_recommended_action_summaries,
-    _collect_recommended_actions,
-    _parse_datetime,
+from .compute_optimizer_automation_global import (
     _parse_global_next_token,
-    create_compute_optimizer_automation_client,
-    get_automation_event,
-    get_automation_event_global,
-    get_automation_rule,
-    get_enrollment_configuration,
-    list_accounts,
-    list_automation_event_steps,
-    list_automation_event_summaries,
-    list_automation_events,
-    list_automation_rule_preview,
-    list_automation_rule_preview_summaries,
-    list_automation_rules,
-    list_recommended_action_summaries,
-    list_recommended_actions,
-    list_tags_for_resource,
-    run_global_list,
+    dispatch_global,
+)
+from .compute_optimizer_automation_operations import (
+    VALID_OPERATIONS as VALID_OPERATIONS,
+)
+from .compute_optimizer_automation_operations import (
+    _parse_datetime,
+    dispatch_regional,
 )
 from botocore import xform_name
 from fastmcp import Context, FastMCP
@@ -64,23 +48,6 @@ from typing import Any, Dict, List, Optional
 
 _SERVICE_NAME = 'Compute Optimizer Automation'
 _BOTO_SERVICE_NAME = 'compute-optimizer-automation'
-
-# The operations this tool supports, in the order presented to callers.
-VALID_OPERATIONS = [
-    'get_automation_event',
-    'get_automation_rule',
-    'get_enrollment_configuration',
-    'list_accounts',
-    'list_automation_events',
-    'list_automation_event_steps',
-    'list_automation_event_summaries',
-    'list_automation_rules',
-    'list_recommended_actions',
-    'list_recommended_action_summaries',
-    'list_automation_rule_preview',
-    'list_automation_rule_preview_summaries',
-    'list_tags_for_resource',
-]
 
 # Operations whose data is account-global: a single regional endpoint returns
 # everything (rules are global resources; enrollment and account lists are
@@ -311,7 +278,7 @@ async def compute_optimizer_automation(
         # With no explicit region, most operations fan out across all Automation
         # regions; account-global operations still use a single default-region call.
         if region is None and operation not in _SINGLE_REGION_OPERATIONS:
-            return await _dispatch_global(
+            return await dispatch_global(
                 ctx,
                 operation,
                 event_id=event_id,
@@ -343,209 +310,29 @@ async def compute_optimizer_automation(
                     'explicit-region query.',
                 )
 
-        client = create_compute_optimizer_automation_client(region)
-
-        # Map each operation to a thunk that invokes its handler with the params it
-        # accepts. Each handler has a different signature, so the per-operation argument
-        # shaping lives in these adapters rather than in the handlers themselves.
-        handlers = {
-            'get_automation_event': lambda: get_automation_event(ctx, client, str(event_id)),
-            'get_automation_rule': lambda: get_automation_rule(ctx, client, str(rule_arn)),
-            'get_enrollment_configuration': lambda: get_enrollment_configuration(ctx, client),
-            'list_accounts': lambda: list_accounts(
-                ctx, client, max_results, max_pages, next_token
-            ),
-            'list_automation_events': lambda: list_automation_events(
-                ctx, client, filters, start_time, end_time, max_results, max_pages, next_token
-            ),
-            'list_automation_event_steps': lambda: list_automation_event_steps(
-                ctx, client, str(event_id), max_results, max_pages, next_token
-            ),
-            'list_automation_event_summaries': lambda: list_automation_event_summaries(
-                ctx, client, filters, start_date, end_date, max_results, max_pages, next_token
-            ),
-            'list_automation_rules': lambda: list_automation_rules(
-                ctx, client, filters, max_results, max_pages, next_token
-            ),
-            'list_recommended_actions': lambda: list_recommended_actions(
-                ctx, client, filters, max_results, max_pages, next_token
-            ),
-            'list_recommended_action_summaries': lambda: list_recommended_action_summaries(
-                ctx, client, filters, max_results, max_pages, next_token
-            ),
-            'list_automation_rule_preview': lambda: list_automation_rule_preview(
-                ctx,
-                client,
-                str(rule_type),
-                str(recommended_action_types),
-                organization_scope,
-                criteria,
-                max_results,
-                max_pages,
-                next_token,
-            ),
-            'list_automation_rule_preview_summaries': lambda: list_automation_rule_preview_summaries(
-                ctx,
-                client,
-                str(rule_type),
-                str(recommended_action_types),
-                organization_scope,
-                criteria,
-                max_results,
-                max_pages,
-                next_token,
-            ),
-            'list_tags_for_resource': lambda: list_tags_for_resource(
-                ctx, client, str(resource_arn)
-            ),
-        }
-
-        handler = handlers.get(operation)
-        if handler is None:
-            return format_response(
-                'error',
-                {'provided_operation': operation, 'valid_operations': VALID_OPERATIONS},
-                f'Unsupported operation: {operation}. Valid operations: {", ".join(VALID_OPERATIONS)}.',
-            )
-
-        return await handler()
+        return await dispatch_regional(
+            ctx,
+            operation,
+            region=region,
+            event_id=event_id,
+            rule_arn=rule_arn,
+            resource_arn=resource_arn,
+            filters=filters,
+            start_time=start_time,
+            end_time=end_time,
+            start_date=start_date,
+            end_date=end_date,
+            rule_type=rule_type,
+            recommended_action_types=recommended_action_types,
+            organization_scope=organization_scope,
+            criteria=criteria,
+            max_results=max_results,
+            max_pages=max_pages,
+            next_token=next_token,
+        )
 
     except Exception as e:
         return await handle_aws_error(ctx, e, operation, _SERVICE_NAME)
-
-
-async def _dispatch_global(
-    ctx: Context,
-    operation: str,
-    event_id: Optional[str] = None,
-    filters: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    rule_type: Optional[str] = None,
-    recommended_action_types: Optional[str] = None,
-    organization_scope: Optional[str] = None,
-    criteria: Optional[str] = None,
-    max_results: Optional[int] = None,
-    max_pages: int = 10,
-    next_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Run a fan-out operation across all Compute Optimizer Automation regions.
-
-    Handles the operations that carry region-scoped data (events, recommended
-    actions, and their summaries and previews). get_automation_event is located by
-    ID across regions; the list operations paginate each region and merge.
-
-    Args:
-        ctx: The MCP context object.
-        operation: The requested region-scoped operation.
-        event_id: Automation event ID (get_automation_event, list_automation_event_steps).
-        filters: Optional JSON string list of {name, values} filter objects.
-        start_time: Optional inclusive start datetime (list_automation_events).
-        end_time: Optional exclusive end datetime (list_automation_events).
-        start_date: Optional inclusive start date (list_automation_event_summaries).
-        end_date: Optional exclusive end date (list_automation_event_summaries).
-        rule_type: Rule type for the preview operations.
-        recommended_action_types: JSON string array of action types (preview operations).
-        organization_scope: Optional JSON string {accountIds: [...]} (preview operations).
-        criteria: Optional JSON string of rule criteria (preview operations).
-        max_results: Optional maximum number of results per page.
-        max_pages: Maximum number of API pages to fetch per region. Defaults to 10.
-        next_token: Optional opaque global token to resume regions with more pages.
-
-    Returns:
-        The merged multi-region response, or an error response.
-    """
-    # get_automation_event is a lookup by ID (no pagination) across regions.
-    if operation == 'get_automation_event':
-        return await get_automation_event_global(ctx, str(event_id))
-
-    regions_tokens, token_error = _parse_global_next_token(next_token)
-    if token_error is not None:
-        return token_error
-
-    # Each entry: (list_key, collect(client, token) -> (items, token), not_found_is_empty).
-    global_handlers = {
-        'list_automation_events': (
-            'automation_events',
-            lambda client, token: _collect_automation_events(
-                ctx, client, filters, start_time, end_time, max_results, max_pages, token
-            ),
-            False,
-        ),
-        'list_automation_event_steps': (
-            'automation_event_steps',
-            lambda client, token: _collect_automation_event_steps(
-                ctx, client, str(event_id), max_results, max_pages, token
-            ),
-            True,
-        ),
-        'list_automation_event_summaries': (
-            'automation_event_summaries',
-            lambda client, token: _collect_automation_event_summaries(
-                ctx, client, filters, start_date, end_date, max_results, max_pages, token
-            ),
-            False,
-        ),
-        'list_recommended_actions': (
-            'recommended_actions',
-            lambda client, token: _collect_recommended_actions(
-                ctx, client, filters, max_results, max_pages, token
-            ),
-            False,
-        ),
-        'list_recommended_action_summaries': (
-            'recommended_action_summaries',
-            lambda client, token: _collect_recommended_action_summaries(
-                ctx, client, filters, max_results, max_pages, token
-            ),
-            False,
-        ),
-        'list_automation_rule_preview': (
-            'preview_results',
-            lambda client, token: _collect_automation_rule_preview(
-                ctx,
-                client,
-                str(rule_type),
-                str(recommended_action_types),
-                organization_scope,
-                criteria,
-                max_results,
-                max_pages,
-                token,
-            ),
-            False,
-        ),
-        'list_automation_rule_preview_summaries': (
-            'preview_result_summaries',
-            lambda client, token: _collect_automation_rule_preview_summaries(
-                ctx,
-                client,
-                str(rule_type),
-                str(recommended_action_types),
-                organization_scope,
-                criteria,
-                max_results,
-                max_pages,
-                token,
-            ),
-            False,
-        ),
-    }
-
-    spec = global_handlers.get(operation)
-    if spec is None:
-        return format_response(
-            'error',
-            {'provided_operation': operation, 'valid_operations': VALID_OPERATIONS},
-            f'Unsupported operation: {operation}. Valid operations: {", ".join(VALID_OPERATIONS)}.',
-        )
-
-    list_key, collect, not_found_is_empty = spec
-    return await run_global_list(
-        ctx, operation, list_key, regions_tokens, collect, not_found_is_empty
-    )
 
 
 def _validate_operation_params(
