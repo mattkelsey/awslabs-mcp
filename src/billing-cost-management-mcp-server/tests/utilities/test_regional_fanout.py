@@ -19,6 +19,7 @@ from awslabs.billing_cost_management_mcp_server.utilities.regional_fanout import
     RegionalTokenError,
     decode_regional_next_token,
     encode_regional_next_token,
+    fan_out_regional_pages,
     fan_out_regions,
 )
 
@@ -65,6 +66,44 @@ async def test_fan_out_regions_rejects_invalid_concurrency():
             format_error,
             max_concurrency=0,
         )
+
+
+async def test_fan_out_regional_pages_merges_items_tokens_and_outcomes():
+    """Regional pages are merged, stamped, and retain errors and misses."""
+
+    async def worker(region, state):
+        if state == 'miss':
+            raise LookupError(region)
+        if state == 'error':
+            raise RuntimeError(region)
+        if state == 'more':
+            return [{'id': 'one', 'region': ''}], 'service-token'
+        return [{'id': 'two', 'region': 'source-region'}], None
+
+    async def format_error(region, error):
+        return {'region': region, 'message': str(error)}
+
+    result = await fan_out_regional_pages(
+        {
+            'us-east-1': 'more',
+            'us-west-2': 'done',
+            'eu-west-1': 'miss',
+            'ap-south-1': 'error',
+        },
+        worker,
+        format_error,
+        max_concurrency=2,
+        is_miss=lambda error: isinstance(error, LookupError),
+    )
+
+    assert result.items == [
+        {'id': 'one', 'region': 'us-east-1'},
+        {'id': 'two', 'region': 'us-west-2'},
+    ]
+    assert result.next_tokens == {'us-east-1': 'service-token'}
+    assert result.successful_regions == ['us-east-1', 'us-west-2']
+    assert result.misses == ['eu-west-1']
+    assert result.errors == {'ap-south-1': {'region': 'ap-south-1', 'message': 'ap-south-1'}}
 
 
 def test_regional_next_token_round_trip():

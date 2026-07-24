@@ -18,8 +18,9 @@ import asyncio
 import base64
 import binascii
 import json
-from .aws_service_base import format_response
+from .aws_service_base import format_response, handle_aws_error
 from dataclasses import dataclass
+from fastmcp import Context
 from typing import (
     Any,
     Awaitable,
@@ -48,6 +49,17 @@ class RegionalFanoutResult(Generic[Success, Error]):
     successes: Dict[str, Success]
     errors: Dict[str, Error]
     misses: List[str]
+
+
+@dataclass
+class RegionalPageResult(Generic[Error]):
+    """Merged outcomes from paginated regional list operations."""
+
+    items: List[Dict[str, Any]]
+    next_tokens: Dict[str, str]
+    errors: Dict[str, Error]
+    misses: List[str]
+    successful_regions: List[str]
 
 
 class RegionalTokenError(ValueError):
@@ -120,6 +132,64 @@ async def fan_out_regions(
             successes[region] = cast(Success, value)
 
     return RegionalFanoutResult(successes=successes, errors=errors, misses=misses)
+
+
+async def fan_out_regional_pages(
+    requests: Mapping[str, RequestState],
+    worker: Callable[
+        [str, RequestState],
+        Awaitable[Tuple[List[Dict[str, Any]], Optional[str]]],
+    ],
+    format_error: Callable[[str, Exception], Awaitable[Error]],
+    *,
+    max_concurrency: int,
+    is_miss: Optional[Callable[[Exception], bool]] = None,
+) -> RegionalPageResult[Error]:
+    """Execute regional list workers and merge their items and pagination state."""
+    outcomes = await fan_out_regions(
+        requests,
+        worker,
+        format_error,
+        max_concurrency=max_concurrency,
+        is_miss=is_miss,
+    )
+
+    items: List[Dict[str, Any]] = []
+    next_tokens: Dict[str, str] = {}
+    for region, (regional_items, next_token) in outcomes.successes.items():
+        for item in regional_items:
+            item['region'] = region
+            items.append(item)
+        if next_token:
+            next_tokens[region] = next_token
+
+    return RegionalPageResult(
+        items=items,
+        next_tokens=next_tokens,
+        errors=outcomes.errors,
+        misses=outcomes.misses,
+        successful_regions=list(outcomes.successes),
+    )
+
+
+async def format_regional_aws_error(
+    ctx: Context,
+    error: Exception,
+    operation: str,
+    service_name: str,
+) -> Dict[str, Any]:
+    """Classify an AWS regional failure and retain fields useful to callers."""
+    classified = await handle_aws_error(ctx, error, operation, service_name)
+    useful_fields = (
+        'error_type',
+        'message',
+        'request_id',
+        'http_status',
+        'boto_error_type',
+        'exception_type',
+        'details',
+    )
+    return {field: classified[field] for field in useful_fields if field in classified}
 
 
 def encode_regional_next_token(region_next_tokens: Mapping[str, str]) -> str:

@@ -32,7 +32,9 @@ import botocore.session
 from ..utilities.aws_service_base import format_response, handle_aws_error, parse_json
 from ..utilities.regional_fanout import (
     encode_regional_next_token,
+    fan_out_regional_pages,
     fan_out_regions,
+    format_regional_aws_error,
     parse_regional_next_token,
 )
 from ..utilities.sql_utils import convert_response_if_needed
@@ -600,21 +602,6 @@ def _is_resource_not_found(error: Exception) -> bool:
     return type(error).__name__ == 'ResourceNotFoundException'
 
 
-async def _format_region_error(ctx: Context, error: Exception, operation: str) -> Dict[str, Any]:
-    """Classify a regional failure using the shared AWS error handler."""
-    classified = await handle_aws_error(ctx, error, operation, _SERVICE_NAME)
-    useful_fields = (
-        'error_type',
-        'message',
-        'request_id',
-        'http_status',
-        'boto_error_type',
-        'exception_type',
-        'details',
-    )
-    return {field: classified[field] for field in useful_fields if field in classified}
-
-
 async def _run_global_list(
     ctx: Context,
     operation: str,
@@ -632,9 +619,9 @@ async def _run_global_list(
         return await collect(client, token)
 
     async def format_error(region: str, error: Exception) -> Dict[str, Any]:
-        return await _format_region_error(ctx, error, operation)
+        return await format_regional_aws_error(ctx, error, operation, _SERVICE_NAME)
 
-    outcomes = await fan_out_regions(
+    outcomes = await fan_out_regional_pages(
         regions_tokens,
         worker,
         format_error,
@@ -642,17 +629,7 @@ async def _run_global_list(
         is_miss=_is_resource_not_found if not_found_is_empty else None,
     )
 
-    merged: List[Dict[str, Any]] = []
-    region_next_tokens: Dict[str, str] = {}
-    for region, (items, leftover) in outcomes.successes.items():
-        for item in items:
-            if not item.get('region'):
-                item['region'] = region
-            merged.append(item)
-        if leftover:
-            region_next_tokens[region] = leftover
-
-    successful_regions = len(outcomes.successes)
+    successful_regions = len(outcomes.successful_regions)
     if not_found_is_empty and outcomes.misses and not outcomes.errors and not successful_regions:
         return format_response(
             'error',
@@ -686,9 +663,9 @@ async def _run_global_list(
         ctx,
         operation,
         list_key,
-        merged,
+        outcomes.items,
         list(regions_tokens),
-        region_next_tokens,
+        outcomes.next_tokens,
         outcomes.errors,
     )
 
@@ -739,7 +716,7 @@ async def _get_automation_event_global(ctx: Context, event_id: str) -> Dict[str,
         return await asyncio.to_thread(client.get_automation_event, eventId=request_event_id)
 
     async def format_error(region: str, error: Exception) -> Dict[str, Any]:
-        return await _format_region_error(ctx, error, 'get_automation_event')
+        return await format_regional_aws_error(ctx, error, 'get_automation_event', _SERVICE_NAME)
 
     await ctx.info(f'Searching all Automation regions for automation event {event_id}')
     outcomes = await fan_out_regions(
