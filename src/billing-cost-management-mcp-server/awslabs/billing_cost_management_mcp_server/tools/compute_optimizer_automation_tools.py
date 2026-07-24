@@ -27,27 +27,64 @@ and their summaries and previews) query every Automation region concurrently and
 results. Pass a `region` to target a single region.
 """
 
+import asyncio
 import botocore.session
 from ..utilities.aws_service_base import format_response, handle_aws_error, parse_json
-from .compute_optimizer_automation_global import (
-    _parse_global_next_token,
-    dispatch_global,
+from ..utilities.regional_fanout import (
+    RegionalTokenError,
+    decode_regional_next_token,
+    encode_regional_next_token,
+    fan_out_regions,
 )
+from ..utilities.sql_utils import convert_response_if_needed
 from .compute_optimizer_automation_operations import (
     VALID_OPERATIONS as VALID_OPERATIONS,
 )
 from .compute_optimizer_automation_operations import (
+    _collect_automation_event_steps,
+    _collect_automation_event_summaries,
+    _collect_automation_events,
+    _collect_automation_rule_preview,
+    _collect_automation_rule_preview_summaries,
+    _collect_recommended_action_summaries,
+    _collect_recommended_actions,
+    _format_automation_event,
     _parse_datetime,
+    create_compute_optimizer_automation_client,
     dispatch_regional,
 )
 from botocore import xform_name
 from fastmcp import Context, FastMCP
 from functools import lru_cache
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 
 _SERVICE_NAME = 'Compute Optimizer Automation'
 _BOTO_SERVICE_NAME = 'compute-optimizer-automation'
+_MAX_CONCURRENT_REGIONS = 8
+
+# The AWS regions where Compute Optimizer Automation is available. The service is
+# absent from botocore's endpoints.json (it ships only an endpoint rule set), so
+# there is no local API to enumerate its regions; this list is maintained by hand.
+COMPUTE_OPTIMIZER_AUTOMATION_REGIONS = [
+    'ap-northeast-1',
+    'ap-northeast-2',
+    'ap-northeast-3',
+    'ap-south-1',
+    'ap-southeast-1',
+    'ap-southeast-2',
+    'ca-central-1',
+    'eu-central-1',
+    'eu-north-1',
+    'eu-west-1',
+    'eu-west-2',
+    'eu-west-3',
+    'sa-east-1',
+    'us-east-1',
+    'us-east-2',
+    'us-west-1',
+    'us-west-2',
+]
 
 # Operations whose data is account-global: a single regional endpoint returns
 # everything (rules are global resources; enrollment and account lists are
@@ -333,6 +370,353 @@ async def compute_optimizer_automation(
 
     except Exception as e:
         return await handle_aws_error(ctx, e, operation, _SERVICE_NAME)
+
+
+async def dispatch_global(
+    ctx: Context,
+    operation: str,
+    event_id: Optional[str] = None,
+    filters: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    rule_type: Optional[str] = None,
+    recommended_action_types: Optional[str] = None,
+    organization_scope: Optional[str] = None,
+    criteria: Optional[str] = None,
+    max_results: Optional[int] = None,
+    max_pages: int = 10,
+    next_token: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a fan-out operation across all Compute Optimizer Automation regions."""
+    if operation == 'get_automation_event':
+        return await _get_automation_event_global(ctx, str(event_id))
+
+    regions_tokens, token_error = _parse_global_next_token(next_token)
+    if token_error is not None:
+        return token_error
+
+    # Each entry: (list_key, collect(client, token) -> (items, token), not_found_is_empty).
+    global_handlers = {
+        'list_automation_events': (
+            'automation_events',
+            lambda client, token: _collect_automation_events(
+                ctx, client, filters, start_time, end_time, max_results, max_pages, token
+            ),
+            False,
+        ),
+        'list_automation_event_steps': (
+            'automation_event_steps',
+            lambda client, token: _collect_automation_event_steps(
+                ctx, client, str(event_id), max_results, max_pages, token
+            ),
+            True,
+        ),
+        'list_automation_event_summaries': (
+            'automation_event_summaries',
+            lambda client, token: _collect_automation_event_summaries(
+                ctx, client, filters, start_date, end_date, max_results, max_pages, token
+            ),
+            False,
+        ),
+        'list_recommended_actions': (
+            'recommended_actions',
+            lambda client, token: _collect_recommended_actions(
+                ctx, client, filters, max_results, max_pages, token
+            ),
+            False,
+        ),
+        'list_recommended_action_summaries': (
+            'recommended_action_summaries',
+            lambda client, token: _collect_recommended_action_summaries(
+                ctx, client, filters, max_results, max_pages, token
+            ),
+            False,
+        ),
+        'list_automation_rule_preview': (
+            'preview_results',
+            lambda client, token: _collect_automation_rule_preview(
+                ctx,
+                client,
+                str(rule_type),
+                str(recommended_action_types),
+                organization_scope,
+                criteria,
+                max_results,
+                max_pages,
+                token,
+            ),
+            False,
+        ),
+        'list_automation_rule_preview_summaries': (
+            'preview_result_summaries',
+            lambda client, token: _collect_automation_rule_preview_summaries(
+                ctx,
+                client,
+                str(rule_type),
+                str(recommended_action_types),
+                organization_scope,
+                criteria,
+                max_results,
+                max_pages,
+                token,
+            ),
+            False,
+        ),
+    }
+
+    spec = global_handlers.get(operation)
+    if spec is None:
+        return format_response(
+            'error',
+            {'provided_operation': operation, 'valid_operations': VALID_OPERATIONS},
+            f'Unsupported operation: {operation}. Valid operations: {", ".join(VALID_OPERATIONS)}.',
+        )
+
+    list_key, collect, not_found_is_empty = spec
+    return await _run_global_list(
+        ctx, operation, list_key, regions_tokens, collect, not_found_is_empty
+    )
+
+
+def _encode_global_next_token(region_next_tokens: Dict[str, str]) -> str:
+    """Encode per-region pagination state as one opaque tool token."""
+    return encode_regional_next_token(region_next_tokens)
+
+
+def _parse_global_next_token(
+    next_token: Optional[str],
+) -> Tuple[Dict[str, Optional[str]], Optional[Dict[str, Any]]]:
+    """Resolve a global token into the regions and AWS tokens to resume."""
+    try:
+        return (
+            decode_regional_next_token(next_token, COMPUTE_OPTIMIZER_AUTOMATION_REGIONS),
+            None,
+        )
+    except RegionalTokenError as error:
+        data: Dict[str, Any] = {'parameter': 'next_token'}
+        if error.reason == 'decode_error':
+            data['supported_regions'] = COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
+            message = (
+                'Invalid global next_token. If this token came from a global response, pass '
+                'it back unchanged. If it came from an explicit-region query, pass `region` '
+                f'along with it. Decode error: {error.details["cause"]}'
+            )
+        elif error.reason == 'not_region_map':
+            message = (
+                'Invalid global next_token: decoded pagination state must be a non-empty '
+                'region-to-token map. Pass the previous global response next_token unchanged.'
+            )
+        elif error.reason == 'empty_region_map':
+            message = (
+                'Invalid global next_token: the regional pagination map is empty. Start a new '
+                'global query by omitting next_token.'
+            )
+        elif error.reason == 'invalid_region_tokens':
+            data['invalid_regions'] = error.details['regions']
+            message = (
+                'Invalid global next_token: every regional token must be a non-empty string. '
+                'Pass the previous global response next_token unchanged.'
+            )
+        else:
+            unsupported_regions = error.details['regions']
+            data['unsupported_regions'] = unsupported_regions
+            data['supported_regions'] = COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
+            message = (
+                'Invalid global next_token: it contains unsupported region key(s): '
+                f'{", ".join(unsupported_regions)}. Pass the previous global response '
+                'next_token unchanged.'
+            )
+        return {}, format_response('error', data, message)
+
+
+def _is_resource_not_found(error: Exception) -> bool:
+    """Return True for a Compute Optimizer Automation not-found error."""
+    response = getattr(error, 'response', None)
+    if isinstance(response, dict):
+        if response.get('Error', {}).get('Code') == 'ResourceNotFoundException':
+            return True
+    return type(error).__name__ == 'ResourceNotFoundException'
+
+
+async def _format_region_error(ctx: Context, error: Exception, operation: str) -> Dict[str, Any]:
+    """Classify a regional failure using the shared AWS error handler."""
+    classified = await handle_aws_error(ctx, error, operation, _SERVICE_NAME)
+    useful_fields = (
+        'error_type',
+        'message',
+        'request_id',
+        'http_status',
+        'boto_error_type',
+        'exception_type',
+        'details',
+    )
+    return {field: classified[field] for field in useful_fields if field in classified}
+
+
+async def _run_global_list(
+    ctx: Context,
+    operation: str,
+    list_key: str,
+    regions_tokens: Dict[str, Optional[str]],
+    collect: Callable[[Any, Optional[str]], Awaitable[Tuple[List[Dict[str, Any]], Optional[str]]]],
+    not_found_is_empty: bool = False,
+) -> Dict[str, Any]:
+    """Run and merge a regional list operation."""
+
+    async def worker(
+        region: str, token: Optional[str]
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        client = await asyncio.to_thread(create_compute_optimizer_automation_client, region)
+        return await collect(client, token)
+
+    async def format_error(region: str, error: Exception) -> Dict[str, Any]:
+        return await _format_region_error(ctx, error, operation)
+
+    outcomes = await fan_out_regions(
+        regions_tokens,
+        worker,
+        format_error,
+        max_concurrency=_MAX_CONCURRENT_REGIONS,
+        is_miss=_is_resource_not_found if not_found_is_empty else None,
+    )
+
+    merged: List[Dict[str, Any]] = []
+    region_next_tokens: Dict[str, str] = {}
+    for region, (items, leftover) in outcomes.successes.items():
+        for item in items:
+            if not item.get('region'):
+                item['region'] = region
+            merged.append(item)
+        if leftover:
+            region_next_tokens[region] = leftover
+
+    successful_regions = len(outcomes.successes)
+    if not_found_is_empty and outcomes.misses and not outcomes.errors and not successful_regions:
+        return format_response(
+            'error',
+            {
+                'operation': operation,
+                'regions_queried': list(regions_tokens),
+                'regions_not_found': outcomes.misses,
+            },
+            f'The requested resource was not found in any of the {len(outcomes.misses)} '
+            f'region(s) queried for {operation}.',
+        )
+
+    if outcomes.errors and not successful_regions:
+        data: Dict[str, Any] = {
+            'operation': operation,
+            'regions_queried': list(regions_tokens),
+            'region_errors': outcomes.errors,
+        }
+        if outcomes.misses:
+            data['regions_not_found'] = outcomes.misses
+            message = (
+                f'Could not determine whether the requested resource exists for {operation}: '
+                f'{len(outcomes.errors)} region(s) failed and {len(outcomes.misses)} returned '
+                'not found.'
+            )
+        else:
+            message = f'All {len(outcomes.errors)} region(s) failed for {operation}.'
+        return format_response('error', data, message)
+
+    return await _finalize_global_list_response(
+        ctx,
+        operation,
+        list_key,
+        merged,
+        list(regions_tokens),
+        region_next_tokens,
+        outcomes.errors,
+    )
+
+
+async def _finalize_global_list_response(
+    ctx: Context,
+    operation: str,
+    list_key: str,
+    items: List[Dict[str, Any]],
+    regions_queried: List[str],
+    region_next_tokens: Dict[str, str],
+    region_errors: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a merged multi-region list response, offloading to SQL when large."""
+    response_data: Dict[str, Any] = {
+        list_key: items,
+        'count': len(items),
+        'regions_queried': regions_queried,
+    }
+    global_next_token = None
+    if region_next_tokens:
+        global_next_token = _encode_global_next_token(region_next_tokens)
+        response_data['next_token'] = global_next_token
+    if region_errors:
+        response_data['region_errors'] = region_errors
+
+    offload_metadata: Dict[str, Any] = {'regions_queried': regions_queried}
+    if global_next_token:
+        offload_metadata['next_token'] = global_next_token
+    if region_errors:
+        offload_metadata['region_errors'] = region_errors
+
+    response_data = await convert_response_if_needed(
+        ctx,
+        response_data,
+        f'compute_optimizer_automation_{operation}',
+        pagination_token_key='next_token',
+        **offload_metadata,
+    )
+    return format_response('success', response_data)
+
+
+async def _get_automation_event_global(ctx: Context, event_id: str) -> Dict[str, Any]:
+    """Locate an automation event by ID across all Automation regions."""
+
+    async def worker(region: str, request_event_id: str) -> Optional[Dict[str, Any]]:
+        client = await asyncio.to_thread(create_compute_optimizer_automation_client, region)
+        return await asyncio.to_thread(client.get_automation_event, eventId=request_event_id)
+
+    async def format_error(region: str, error: Exception) -> Dict[str, Any]:
+        return await _format_region_error(ctx, error, 'get_automation_event')
+
+    await ctx.info(f'Searching all Automation regions for automation event {event_id}')
+    outcomes = await fan_out_regions(
+        dict.fromkeys(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS, event_id),
+        worker,
+        format_error,
+        max_concurrency=_MAX_CONCURRENT_REGIONS,
+        is_miss=_is_resource_not_found,
+    )
+
+    for region, response in outcomes.successes.items():
+        if response is not None:
+            return format_response(
+                'success',
+                {
+                    'automation_event': _format_automation_event(response),
+                    'found_in_region': region,
+                },
+            )
+
+    data: Dict[str, Any] = {
+        'event_id': event_id,
+        'regions_queried': list(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS),
+    }
+    if outcomes.errors:
+        data['region_errors'] = outcomes.errors
+        data['regions_not_found'] = outcomes.misses
+        return format_response(
+            'error',
+            data,
+            f'Could not determine whether automation event {event_id} exists because '
+            f'{len(outcomes.errors)} of {len(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS)} region(s) '
+            'could not be searched. Review region_errors and retry.',
+        )
+    return format_response(
+        'error', data, f'Automation event {event_id} was not found in any region.'
+    )
 
 
 def _validate_operation_params(
