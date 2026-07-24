@@ -31,7 +31,7 @@ from ..utilities.time_utils import (
 )
 from datetime import datetime, timezone
 from fastmcp import Context
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # ===== Formatting helpers =====
@@ -793,6 +793,36 @@ async def list_tags_for_resource(
 # ===== Multi-region collection helpers =====
 
 
+async def _collect_paginated(
+    ctx: Context,
+    api_call: Callable[..., Dict[str, Any]],
+    request_params: Dict[str, Any],
+    response_key: str,
+    formatter: Callable[[Dict[str, Any]], Dict[str, Any]],
+    item_name: str,
+    max_pages: int,
+    next_token: Optional[str],
+    log_suffix: str = '',
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Collect and format a bounded number of pages from a regional list API."""
+    items: List[Dict[str, Any]] = []
+    current_token = next_token
+
+    for page_number in range(1, max_pages + 1):
+        if current_token:
+            request_params['nextToken'] = current_token
+
+        await ctx.info(f'Fetching {item_name} page {page_number}{log_suffix}')
+        response = await asyncio.to_thread(api_call, **request_params)
+
+        items.extend(formatter(item) for item in response.get(response_key, []))
+        current_token = response.get('nextToken')
+        if not current_token:
+            break
+
+    return items, current_token
+
+
 async def _collect_automation_events(
     ctx: Context,
     client: Any,
@@ -819,27 +849,16 @@ async def _collect_automation_events(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_events: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching automation events page {page_count}')
-        response = await asyncio.to_thread(client.list_automation_events, **request_params)
-
-        all_events.extend(
-            _format_automation_event(event) for event in response.get('automationEvents', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_events, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_automation_events,
+        request_params,
+        'automationEvents',
+        _format_automation_event,
+        'automation events',
+        max_pages,
+        next_token,
+    )
 
 
 async def _collect_automation_event_steps(
@@ -858,28 +877,17 @@ async def _collect_automation_event_steps(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_steps: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching automation event steps page {page_count} for event {event_id}')
-        response = await asyncio.to_thread(client.list_automation_event_steps, **request_params)
-
-        all_steps.extend(
-            _format_automation_event_step(step)
-            for step in response.get('automationEventSteps', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_steps, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_automation_event_steps,
+        request_params,
+        'automationEventSteps',
+        _format_automation_event_step,
+        'automation event steps',
+        max_pages,
+        next_token,
+        f' for event {event_id}',
+    )
 
 
 async def _collect_automation_event_summaries(
@@ -908,30 +916,16 @@ async def _collect_automation_event_summaries(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_summaries: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching automation event summaries page {page_count}')
-        response = await asyncio.to_thread(
-            client.list_automation_event_summaries, **request_params
-        )
-
-        all_summaries.extend(
-            _format_event_summary(summary)
-            for summary in response.get('automationEventSummaries', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_summaries, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_automation_event_summaries,
+        request_params,
+        'automationEventSummaries',
+        _format_event_summary,
+        'automation event summaries',
+        max_pages,
+        next_token,
+    )
 
 
 async def _collect_recommended_actions(
@@ -954,27 +948,16 @@ async def _collect_recommended_actions(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_actions: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching recommended actions page {page_count}')
-        response = await asyncio.to_thread(client.list_recommended_actions, **request_params)
-
-        all_actions.extend(
-            _format_recommended_action(action) for action in response.get('recommendedActions', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_actions, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_recommended_actions,
+        request_params,
+        'recommendedActions',
+        _format_recommended_action,
+        'recommended actions',
+        max_pages,
+        next_token,
+    )
 
 
 async def _collect_recommended_action_summaries(
@@ -997,29 +980,16 @@ async def _collect_recommended_action_summaries(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_summaries: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching recommended action summaries page {page_count}')
-        response = await asyncio.to_thread(
-            client.list_recommended_action_summaries, **request_params
-        )
-
-        all_summaries.extend(
-            _format_summary(summary) for summary in response.get('recommendedActionSummaries', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_summaries, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_recommended_action_summaries,
+        request_params,
+        'recommendedActionSummaries',
+        _format_summary,
+        'recommended action summaries',
+        max_pages,
+        next_token,
+    )
 
 
 async def _collect_automation_rule_preview(
@@ -1051,27 +1021,16 @@ async def _collect_automation_rule_preview(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_results: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching automation rule preview page {page_count}')
-        response = await asyncio.to_thread(client.list_automation_rule_preview, **request_params)
-
-        all_results.extend(
-            _format_recommended_action(result) for result in response.get('previewResults', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_results, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_automation_rule_preview,
+        request_params,
+        'previewResults',
+        _format_recommended_action,
+        'automation rule preview',
+        max_pages,
+        next_token,
+    )
 
 
 async def _collect_automation_rule_preview_summaries(
@@ -1103,29 +1062,16 @@ async def _collect_automation_rule_preview_summaries(
     if max_results is not None:
         request_params['maxResults'] = max_results
 
-    all_summaries: List[Dict[str, Any]] = []
-    current_token = next_token
-    page_count = 0
-
-    while page_count < max_pages:
-        page_count += 1
-        if current_token:
-            request_params['nextToken'] = current_token
-
-        await ctx.info(f'Fetching automation rule preview summaries page {page_count}')
-        response = await asyncio.to_thread(
-            client.list_automation_rule_preview_summaries, **request_params
-        )
-
-        all_summaries.extend(
-            _format_summary(summary) for summary in response.get('previewResultSummaries', [])
-        )
-
-        current_token = response.get('nextToken')
-        if not current_token:
-            break
-
-    return all_summaries, current_token
+    return await _collect_paginated(
+        ctx,
+        client.list_automation_rule_preview_summaries,
+        request_params,
+        'previewResultSummaries',
+        _format_summary,
+        'automation rule preview summaries',
+        max_pages,
+        next_token,
+    )
 
 
 # ===== Shared helpers =====
