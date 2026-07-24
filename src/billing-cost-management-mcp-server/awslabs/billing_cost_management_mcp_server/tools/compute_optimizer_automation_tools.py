@@ -31,10 +31,9 @@ import asyncio
 import botocore.session
 from ..utilities.aws_service_base import format_response, handle_aws_error, parse_json
 from ..utilities.regional_fanout import (
-    RegionalTokenError,
-    decode_regional_next_token,
     encode_regional_next_token,
     fan_out_regions,
+    parse_regional_next_token,
 )
 from ..utilities.sql_utils import convert_response_if_needed
 from .compute_optimizer_automation_operations import (
@@ -363,7 +362,9 @@ async def compute_optimizer_automation(
         # Catch the actionable cross-mode mistake locally instead of sending an
         # encoded regional map to AWS as though it were a native service token.
         if next_token:
-            _, global_token_error = _parse_global_next_token(next_token)
+            _, global_token_error = parse_regional_next_token(
+                next_token, COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
+            )
             if global_token_error is None:
                 return format_response(
                     'error',
@@ -501,7 +502,9 @@ async def dispatch_global(
     if operation == 'get_automation_event':
         return await _get_automation_event_global(ctx, str(event_id))
 
-    regions_tokens, token_error = _parse_global_next_token(next_token)
+    regions_tokens, token_error = parse_regional_next_token(
+        next_token, COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
+    )
     if token_error is not None:
         return token_error
 
@@ -586,57 +589,6 @@ async def dispatch_global(
     return await _run_global_list(
         ctx, operation, list_key, regions_tokens, collect, not_found_is_empty
     )
-
-
-def _encode_global_next_token(region_next_tokens: Dict[str, str]) -> str:
-    """Encode per-region pagination state as one opaque tool token."""
-    return encode_regional_next_token(region_next_tokens)
-
-
-def _parse_global_next_token(
-    next_token: Optional[str],
-) -> Tuple[Dict[str, Optional[str]], Optional[Dict[str, Any]]]:
-    """Resolve a global token into the regions and AWS tokens to resume."""
-    try:
-        return (
-            decode_regional_next_token(next_token, COMPUTE_OPTIMIZER_AUTOMATION_REGIONS),
-            None,
-        )
-    except RegionalTokenError as error:
-        data: Dict[str, Any] = {'parameter': 'next_token'}
-        if error.reason == 'decode_error':
-            data['supported_regions'] = COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
-            message = (
-                'Invalid global next_token. If this token came from a global response, pass '
-                'it back unchanged. If it came from an explicit-region query, pass `region` '
-                f'along with it. Decode error: {error.details["cause"]}'
-            )
-        elif error.reason == 'not_region_map':
-            message = (
-                'Invalid global next_token: decoded pagination state must be a non-empty '
-                'region-to-token map. Pass the previous global response next_token unchanged.'
-            )
-        elif error.reason == 'empty_region_map':
-            message = (
-                'Invalid global next_token: the regional pagination map is empty. Start a new '
-                'global query by omitting next_token.'
-            )
-        elif error.reason == 'invalid_region_tokens':
-            data['invalid_regions'] = error.details['regions']
-            message = (
-                'Invalid global next_token: every regional token must be a non-empty string. '
-                'Pass the previous global response next_token unchanged.'
-            )
-        else:
-            unsupported_regions = error.details['regions']
-            data['unsupported_regions'] = unsupported_regions
-            data['supported_regions'] = COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
-            message = (
-                'Invalid global next_token: it contains unsupported region key(s): '
-                f'{", ".join(unsupported_regions)}. Pass the previous global response '
-                'next_token unchanged.'
-            )
-        return {}, format_response('error', data, message)
 
 
 def _is_resource_not_found(error: Exception) -> bool:
@@ -758,7 +710,7 @@ async def _finalize_global_list_response(
     }
     global_next_token = None
     if region_next_tokens:
-        global_next_token = _encode_global_next_token(region_next_tokens)
+        global_next_token = encode_regional_next_token(region_next_tokens)
         response_data['next_token'] = global_next_token
     if region_errors:
         response_data['region_errors'] = region_errors

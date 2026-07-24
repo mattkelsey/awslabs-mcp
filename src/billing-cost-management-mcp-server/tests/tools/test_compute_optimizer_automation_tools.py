@@ -35,6 +35,10 @@ from awslabs.billing_cost_management_mcp_server.tools.compute_optimizer_automati
 from awslabs.billing_cost_management_mcp_server.tools.compute_optimizer_automation_tools import (
     compute_optimizer_automation as automation_fn,
 )
+from awslabs.billing_cost_management_mcp_server.utilities.regional_fanout import (
+    encode_regional_next_token,
+    parse_regional_next_token,
+)
 from botocore.exceptions import ClientError, EndpointConnectionError
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1382,7 +1386,9 @@ class TestGlobalFanOut:
 
         next_token = result['data']['next_token']
         assert isinstance(next_token, str)
-        regions_tokens, error = automation_tools._parse_global_next_token(next_token)
+        regions_tokens, error = parse_regional_next_token(
+            next_token, automation_tools.COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
+        )
         assert error is None
         assert regions_tokens == {'eu-west-1': 'MORE'}
         assert 'region_next_tokens' not in result['data']
@@ -1403,7 +1409,7 @@ class TestGlobalFanOut:
             await automation_fn(
                 mock_ctx,
                 operation='list_recommended_actions',
-                next_token=automation_tools._encode_global_next_token({'eu-west-1': 'abc'}),
+                next_token=encode_regional_next_token({'eu-west-1': 'abc'}),
                 max_pages=1,
             )
 
@@ -1768,7 +1774,7 @@ class TestRegionRouting:
 
     async def test_explicit_region_rejects_global_next_token(self, mock_ctx):
         """A global token with an explicit region yields a corrective validation error."""
-        token = automation_tools._encode_global_next_token({'us-west-2': 'native-token'})
+        token = encode_regional_next_token({'us-west-2': 'native-token'})
 
         with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             result = await automation_fn(
@@ -1854,6 +1860,8 @@ class TestGlobalSqlOffload:
         assert set(data['regions_queried']) == set(
             automation_tools.COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
         )
-        regions_tokens, error = automation_tools._parse_global_next_token(data['next_token'])
+        regions_tokens, error = parse_regional_next_token(
+            data['next_token'], automation_tools.COMPUTE_OPTIMIZER_AUTOMATION_REGIONS
+        )
         assert error is None
         assert regions_tokens == {'us-east-1': 'more-pages'}

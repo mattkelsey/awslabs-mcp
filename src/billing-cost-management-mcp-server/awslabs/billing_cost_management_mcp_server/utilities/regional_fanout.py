@@ -18,6 +18,7 @@ import asyncio
 import base64
 import binascii
 import json
+from .aws_service_base import format_response
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -28,6 +29,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     TypeVar,
     cast,
@@ -127,7 +129,7 @@ def encode_regional_next_token(region_next_tokens: Mapping[str, str]) -> str:
 
 
 def decode_regional_next_token(
-    next_token: Optional[str], supported_regions: List[str]
+    next_token: Optional[str], supported_regions: Sequence[str]
 ) -> Dict[str, Optional[str]]:
     """Decode and validate opaque per-region pagination state.
 
@@ -163,3 +165,48 @@ def decode_regional_next_token(
         raise RegionalTokenError('unsupported_regions', regions=unsupported_regions)
 
     return dict(parsed)
+
+
+def parse_regional_next_token(
+    next_token: Optional[str],
+    supported_regions: Sequence[str],
+) -> Tuple[Dict[str, Optional[str]], Optional[Dict[str, Any]]]:
+    """Resolve an opaque token into regional request state or a validation response."""
+    supported_region_list = list(supported_regions)
+    try:
+        return decode_regional_next_token(next_token, supported_region_list), None
+    except RegionalTokenError as error:
+        data: Dict[str, Any] = {'parameter': 'next_token'}
+        if error.reason == 'decode_error':
+            data['supported_regions'] = supported_region_list
+            message = (
+                'Invalid global next_token. If this token came from a global response, pass '
+                'it back unchanged. If it came from an explicit-region query, pass `region` '
+                f'along with it. Decode error: {error.details["cause"]}'
+            )
+        elif error.reason == 'not_region_map':
+            message = (
+                'Invalid global next_token: decoded pagination state must be a non-empty '
+                'region-to-token map. Pass the previous global response next_token unchanged.'
+            )
+        elif error.reason == 'empty_region_map':
+            message = (
+                'Invalid global next_token: the regional pagination map is empty. Start a new '
+                'global query by omitting next_token.'
+            )
+        elif error.reason == 'invalid_region_tokens':
+            data['invalid_regions'] = error.details['regions']
+            message = (
+                'Invalid global next_token: every regional token must be a non-empty string. '
+                'Pass the previous global response next_token unchanged.'
+            )
+        else:
+            unsupported_regions = error.details['regions']
+            data['unsupported_regions'] = unsupported_regions
+            data['supported_regions'] = supported_region_list
+            message = (
+                'Invalid global next_token: it contains unsupported region key(s): '
+                f'{", ".join(unsupported_regions)}. Pass the previous global response '
+                'next_token unchanged.'
+            )
+        return {}, format_response('error', data, message)
