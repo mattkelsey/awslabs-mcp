@@ -34,23 +34,6 @@ from fastmcp import Context
 from typing import Any, Dict, List, Optional, Tuple
 
 
-VALID_OPERATIONS = [
-    'get_automation_event',
-    'get_automation_rule',
-    'get_enrollment_configuration',
-    'list_accounts',
-    'list_automation_events',
-    'list_automation_event_steps',
-    'list_automation_event_summaries',
-    'list_automation_rules',
-    'list_recommended_actions',
-    'list_recommended_action_summaries',
-    'list_automation_rule_preview',
-    'list_automation_rule_preview_summaries',
-    'list_tags_for_resource',
-]
-
-
 # ===== Formatting helpers =====
 
 
@@ -1225,92 +1208,8 @@ def create_compute_optimizer_automation_client(region: Optional[str] = None) -> 
     return create_aws_client('compute-optimizer-automation', region_name=region)
 
 
-async def dispatch_regional(
-    ctx: Context,
-    operation: str,
-    region: Optional[str] = None,
-    event_id: Optional[str] = None,
-    rule_arn: Optional[str] = None,
-    resource_arn: Optional[str] = None,
-    filters: Optional[str] = None,
-    start_time: Optional[str] = None,
-    end_time: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    rule_type: Optional[str] = None,
-    recommended_action_types: Optional[str] = None,
-    organization_scope: Optional[str] = None,
-    criteria: Optional[str] = None,
-    max_results: Optional[int] = None,
-    max_pages: int = 10,
-    next_token: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Create one regional client and dispatch an operation to its handler."""
-    client = create_compute_optimizer_automation_client(region)
-
-    handlers = {
-        'get_automation_event': lambda: get_automation_event(ctx, client, str(event_id)),
-        'get_automation_rule': lambda: get_automation_rule(ctx, client, str(rule_arn)),
-        'get_enrollment_configuration': lambda: get_enrollment_configuration(ctx, client),
-        'list_accounts': lambda: list_accounts(ctx, client, max_results, max_pages, next_token),
-        'list_automation_events': lambda: list_automation_events(
-            ctx, client, filters, start_time, end_time, max_results, max_pages, next_token
-        ),
-        'list_automation_event_steps': lambda: list_automation_event_steps(
-            ctx, client, str(event_id), max_results, max_pages, next_token
-        ),
-        'list_automation_event_summaries': lambda: list_automation_event_summaries(
-            ctx, client, filters, start_date, end_date, max_results, max_pages, next_token
-        ),
-        'list_automation_rules': lambda: list_automation_rules(
-            ctx, client, filters, max_results, max_pages, next_token
-        ),
-        'list_recommended_actions': lambda: list_recommended_actions(
-            ctx, client, filters, max_results, max_pages, next_token
-        ),
-        'list_recommended_action_summaries': lambda: list_recommended_action_summaries(
-            ctx, client, filters, max_results, max_pages, next_token
-        ),
-        'list_automation_rule_preview': lambda: list_automation_rule_preview(
-            ctx,
-            client,
-            str(rule_type),
-            str(recommended_action_types),
-            organization_scope,
-            criteria,
-            max_results,
-            max_pages,
-            next_token,
-        ),
-        'list_automation_rule_preview_summaries': lambda: list_automation_rule_preview_summaries(
-            ctx,
-            client,
-            str(rule_type),
-            str(recommended_action_types),
-            organization_scope,
-            criteria,
-            max_results,
-            max_pages,
-            next_token,
-        ),
-        'list_tags_for_resource': lambda: list_tags_for_resource(ctx, client, str(resource_arn)),
-    }
-
-    handler = handlers.get(operation)
-    if handler is None:
-        return format_response(
-            'error',
-            {'provided_operation': operation, 'valid_operations': VALID_OPERATIONS},
-            f'Unsupported operation: {operation}. Valid operations: {", ".join(VALID_OPERATIONS)}.',
-        )
-
-    return await handler()
-
-
 __all__ = [
-    'VALID_OPERATIONS',
     'create_compute_optimizer_automation_client',
-    'dispatch_regional',
     'get_automation_event',
     'get_automation_rule',
     'get_enrollment_configuration',

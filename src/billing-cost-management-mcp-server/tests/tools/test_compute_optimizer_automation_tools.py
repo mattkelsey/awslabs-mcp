@@ -705,8 +705,8 @@ class TestDispatchRouting:
     async def test_routes_to_operation_with_client(self, mock_ctx):
         """With an explicit region, the tool creates a client and routes to the handler."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
-            patch(f'{_OPS_MODULE}.get_automation_event', new_callable=AsyncMock) as mock_op,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.get_automation_event', new_callable=AsyncMock) as mock_op,
         ):
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
             fake_client = MagicMock()
@@ -723,9 +723,9 @@ class TestDispatchRouting:
     async def test_passes_region_through(self, mock_ctx):
         """The region parameter is forwarded to the client factory."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
             patch(
-                f'{_OPS_MODULE}.get_enrollment_configuration', new_callable=AsyncMock
+                f'{_TOOLS_MODULE}.get_enrollment_configuration', new_callable=AsyncMock
             ) as mock_op,
         ):
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
@@ -740,9 +740,9 @@ class TestDispatchRouting:
     async def test_forwards_rule_preview_params(self, mock_ctx):
         """Rule-preview params are forwarded positionally to the operation."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
             patch(
-                f'{_OPS_MODULE}.list_automation_rule_preview', new_callable=AsyncMock
+                f'{_TOOLS_MODULE}.list_automation_rule_preview', new_callable=AsyncMock
             ) as mock_op,
         ):
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
@@ -818,8 +818,8 @@ class TestDispatchRouting:
     ):
         """With an explicit region, each operation dispatches to its named handler."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
-            patch(f'{_OPS_MODULE}.{handler}', new_callable=AsyncMock) as mock_op,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.{handler}', new_callable=AsyncMock) as mock_op,
         ):
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
             mock_create.return_value = MagicMock()
@@ -843,7 +843,7 @@ class TestDispatchRouting:
 
     async def test_unsupported_operation_with_explicit_region(self, mock_ctx):
         """An unknown explicit-region operation follows the single-region error path."""
-        with patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
+        with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             result = await automation_fn(
                 mock_ctx, operation='delete_everything', region='us-east-1'
             )
@@ -855,7 +855,7 @@ class TestDispatchRouting:
     async def test_handles_exception(self, mock_ctx):
         """Exceptions are routed through handle_aws_error."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
             patch(f'{_TOOLS_MODULE}.handle_aws_error', new_callable=AsyncMock) as mock_handle,
         ):
             mock_create.side_effect = RuntimeError('boom')
@@ -896,7 +896,7 @@ class TestDispatchValidation:
 
     async def test_missing_resource_arn(self, mock_ctx):
         """list_tags_for_resource without resource_arn errors before creating a client."""
-        with patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
+        with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             result = await automation_fn(mock_ctx, operation='list_tags_for_resource')
 
             assert result['status'] == STATUS_ERROR
@@ -946,8 +946,8 @@ class TestFilterValidation:
     async def test_valid_filter_name_passes(self, mock_ctx):
         """A valid filter name passes validation and reaches the handler."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
-            patch(f'{_OPS_MODULE}.list_automation_events', new_callable=AsyncMock) as mock_op,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.list_automation_events', new_callable=AsyncMock) as mock_op,
         ):
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
             mock_create.return_value = MagicMock()
@@ -965,8 +965,8 @@ class TestFilterValidation:
     async def test_validation_skipped_when_model_unavailable(self, mock_ctx):
         """If the boto model can't be loaded, filter validation is skipped (AWS validates)."""
         with (
-            patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
-            patch(f'{_OPS_MODULE}.list_automation_events', new_callable=AsyncMock) as mock_op,
+            patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create,
+            patch(f'{_TOOLS_MODULE}.list_automation_events', new_callable=AsyncMock) as mock_op,
             patch(f'{_TOOLS_MODULE}._valid_filter_names_by_operation', return_value={}),
         ):
             mock_op.return_value = {'status': STATUS_SUCCESS, 'data': {}}
@@ -1754,7 +1754,7 @@ class TestRegionRouting:
 
     async def test_explicit_region_disables_fan_out(self, mock_ctx):
         """With an explicit region, a fan-out op makes a single-region call, no fan-out."""
-        with patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
+        with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             client = MagicMock()
             client.list_recommended_actions.return_value = {'recommendedActions': []}
             mock_create.return_value = client
@@ -1770,7 +1770,7 @@ class TestRegionRouting:
         """A global token with an explicit region yields a corrective validation error."""
         token = automation_tools._encode_global_next_token({'us-west-2': 'native-token'})
 
-        with patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
+        with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             result = await automation_fn(
                 mock_ctx,
                 operation='list_recommended_actions',
@@ -1784,7 +1784,7 @@ class TestRegionRouting:
 
     async def test_explicit_region_accepts_native_next_token(self, mock_ctx):
         """A native service token proceeds through the explicit-region path."""
-        with patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
+        with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             client = MagicMock()
             client.list_recommended_actions.return_value = {'recommendedActions': []}
             mock_create.return_value = client
@@ -1801,7 +1801,7 @@ class TestRegionRouting:
 
     async def test_account_global_op_uses_single_call_without_region(self, mock_ctx):
         """An account-global op with no region makes one default-region call, no fan-out."""
-        with patch(f'{_OPS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
+        with patch(f'{_TOOLS_MODULE}.create_compute_optimizer_automation_client') as mock_create:
             client = MagicMock()
             client.list_automation_rules.return_value = {'automationRules': []}
             mock_create.return_value = client
