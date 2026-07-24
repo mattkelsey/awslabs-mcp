@@ -52,12 +52,12 @@ class RegionalFanoutResult(Generic[Success, Error]):
 
 
 @dataclass
-class RegionalPageResult(Generic[Error]):
+class RegionalPageResult:
     """Merged outcomes from paginated regional list operations."""
 
     items: List[Dict[str, Any]]
     next_tokens: Dict[str, str]
-    errors: Dict[str, Error]
+    errors: Dict[str, Dict[str, Any]]
     misses: List[str]
     successful_regions: List[str]
 
@@ -134,18 +134,24 @@ async def fan_out_regions(
     return RegionalFanoutResult(successes=successes, errors=errors, misses=misses)
 
 
-async def fan_out_regional_pages(
+async def collect_regional_pages(
     requests: Mapping[str, RequestState],
     worker: Callable[
         [str, RequestState],
         Awaitable[Tuple[List[Dict[str, Any]], Optional[str]]],
     ],
-    format_error: Callable[[str, Exception], Awaitable[Error]],
     *,
+    ctx: Context,
+    operation: str,
+    service_name: str,
     max_concurrency: int,
     is_miss: Optional[Callable[[Exception], bool]] = None,
-) -> RegionalPageResult[Error]:
+) -> RegionalPageResult:
     """Execute regional list workers and merge their items and pagination state."""
+
+    async def format_error(region: str, error: Exception) -> Dict[str, Any]:
+        return await format_regional_aws_error(ctx, error, operation, service_name)
+
     outcomes = await fan_out_regions(
         requests,
         worker,

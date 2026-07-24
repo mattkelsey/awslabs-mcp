@@ -17,11 +17,12 @@
 import pytest
 from awslabs.billing_cost_management_mcp_server.utilities.regional_fanout import (
     RegionalTokenError,
+    collect_regional_pages,
     decode_regional_next_token,
     encode_regional_next_token,
-    fan_out_regional_pages,
     fan_out_regions,
 )
+from unittest.mock import AsyncMock, MagicMock
 
 
 async def test_fan_out_regions_collects_ordered_outcomes():
@@ -68,8 +69,10 @@ async def test_fan_out_regions_rejects_invalid_concurrency():
         )
 
 
-async def test_fan_out_regional_pages_merges_items_tokens_and_outcomes():
+async def test_collect_regional_pages_merges_items_tokens_and_outcomes():
     """Regional pages are merged, stamped, and retain errors and misses."""
+    ctx = MagicMock()
+    ctx.error = AsyncMock()
 
     async def worker(region, state):
         if state == 'miss':
@@ -80,10 +83,7 @@ async def test_fan_out_regional_pages_merges_items_tokens_and_outcomes():
             return [{'id': 'one', 'region': ''}], 'service-token'
         return [{'id': 'two', 'region': 'source-region'}], None
 
-    async def format_error(region, error):
-        return {'region': region, 'message': str(error)}
-
-    result = await fan_out_regional_pages(
+    result = await collect_regional_pages(
         {
             'us-east-1': 'more',
             'us-west-2': 'done',
@@ -91,7 +91,9 @@ async def test_fan_out_regional_pages_merges_items_tokens_and_outcomes():
             'ap-south-1': 'error',
         },
         worker,
-        format_error,
+        ctx=ctx,
+        operation='list_resources',
+        service_name='Test Service',
         max_concurrency=2,
         is_miss=lambda error: isinstance(error, LookupError),
     )
@@ -103,7 +105,8 @@ async def test_fan_out_regional_pages_merges_items_tokens_and_outcomes():
     assert result.next_tokens == {'us-east-1': 'service-token'}
     assert result.successful_regions == ['us-east-1', 'us-west-2']
     assert result.misses == ['eu-west-1']
-    assert result.errors == {'ap-south-1': {'region': 'ap-south-1', 'message': 'ap-south-1'}}
+    assert result.errors['ap-south-1']['error_type'] == 'unknown_runtimeerror'
+    assert result.errors['ap-south-1']['message'] == 'ap-south-1'
 
 
 def test_regional_next_token_round_trip():

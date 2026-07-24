@@ -31,8 +31,8 @@ import asyncio
 import botocore.session
 from ..utilities.aws_service_base import format_response, handle_aws_error, parse_json
 from ..utilities.regional_fanout import (
+    collect_regional_pages,
     encode_regional_next_token,
-    fan_out_regional_pages,
     fan_out_regions,
     format_regional_aws_error,
     parse_regional_next_token,
@@ -618,13 +618,12 @@ async def _run_global_list(
         client = await asyncio.to_thread(create_compute_optimizer_automation_client, region)
         return await collect(client, token)
 
-    async def format_error(region: str, error: Exception) -> Dict[str, Any]:
-        return await format_regional_aws_error(ctx, error, operation, _SERVICE_NAME)
-
-    outcomes = await fan_out_regional_pages(
+    outcomes = await collect_regional_pages(
         regions_tokens,
         worker,
-        format_error,
+        ctx=ctx,
+        operation=operation,
+        service_name=_SERVICE_NAME,
         max_concurrency=_MAX_CONCURRENT_REGIONS,
         is_miss=_is_resource_not_found if not_found_is_empty else None,
     )
