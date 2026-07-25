@@ -34,7 +34,6 @@ from ..utilities.regional_fanout import (
     collect_regional_pages,
     encode_regional_next_token,
     fan_out_regions,
-    format_regional_aws_error,
     parse_regional_next_token,
 )
 from ..utilities.sql_utils import convert_response_if_needed
@@ -726,14 +725,13 @@ async def _get_automation_event_global(ctx: Context, event_id: str) -> Dict[str,
         client = await asyncio.to_thread(create_compute_optimizer_automation_client, region)
         return await asyncio.to_thread(client.get_automation_event, eventId=request_event_id)
 
-    async def format_error(region: str, error: Exception) -> Dict[str, Any]:
-        return await format_regional_aws_error(ctx, error, 'get_automation_event', _SERVICE_NAME)
-
     await ctx.info(f'Searching all Automation regions for automation event {event_id}')
     outcomes = await fan_out_regions(
         dict.fromkeys(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS, event_id),
         worker,
-        format_error,
+        ctx=ctx,
+        operation='get_automation_event',
+        service_name=_SERVICE_NAME,
         max_concurrency=_MAX_CONCURRENT_REGIONS,
     )
 

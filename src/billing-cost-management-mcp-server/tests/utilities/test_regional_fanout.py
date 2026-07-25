@@ -28,6 +28,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 async def test_fan_out_regions_collects_ordered_outcomes():
     """Successes and errors preserve the caller's region order."""
+    ctx = MagicMock()
+    ctx.error = AsyncMock()
 
     async def worker(region, state):
         if state == 'miss':
@@ -36,37 +38,35 @@ async def test_fan_out_regions_collects_ordered_outcomes():
             raise RuntimeError(region)
         return state.upper()
 
-    async def format_error(region, error):
-        return {'region': region, 'message': str(error)}
-
     result = await fan_out_regions(
         {'us-east-1': 'ok', 'us-west-2': 'miss', 'eu-west-1': 'error'},
         worker,
-        format_error,
+        ctx=ctx,
+        operation='get_resource',
+        service_name='Test Service',
         max_concurrency=2,
     )
 
     assert result.successes == {'us-east-1': 'OK'}
-    assert result.errors == {
-        'us-west-2': {'region': 'us-west-2', 'message': 'us-west-2'},
-        'eu-west-1': {'region': 'eu-west-1', 'message': 'eu-west-1'},
-    }
+    assert list(result.errors) == ['us-west-2', 'eu-west-1']
+    assert result.errors['us-west-2']['error_type'] == 'unknown_lookuperror'
+    assert result.errors['eu-west-1']['error_type'] == 'unknown_runtimeerror'
 
 
 async def test_fan_out_regions_rejects_invalid_concurrency():
     """A zero-sized semaphore is rejected rather than hanging."""
+    ctx = MagicMock()
 
     async def worker(region, state):
         return state
-
-    async def format_error(region, error):
-        return str(error)
 
     with pytest.raises(ValueError, match='at least 1'):
         await fan_out_regions(
             {'us-east-1': None},
             worker,
-            format_error,
+            ctx=ctx,
+            operation='get_resource',
+            service_name='Test Service',
             max_concurrency=0,
         )
 

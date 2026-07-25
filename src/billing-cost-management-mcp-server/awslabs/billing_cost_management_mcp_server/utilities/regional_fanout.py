@@ -39,15 +39,14 @@ from typing import (
 
 RequestState = TypeVar('RequestState')
 Success = TypeVar('Success')
-Error = TypeVar('Error')
 
 
 @dataclass
-class RegionalFanoutResult(Generic[Success, Error]):
+class RegionalFanoutResult(Generic[Success]):
     """Outcomes from querying a set of regions."""
 
     successes: Dict[str, Success]
-    errors: Dict[str, Error]
+    errors: Dict[str, Dict[str, Any]]
 
 
 @dataclass
@@ -73,19 +72,23 @@ class RegionalTokenError(ValueError):
 async def fan_out_regions(
     requests: Mapping[str, RequestState],
     worker: Callable[[str, RequestState], Awaitable[Success]],
-    format_error: Callable[[str, Exception], Awaitable[Error]],
     *,
+    ctx: Context,
+    operation: str,
+    service_name: str,
     max_concurrency: int,
-) -> RegionalFanoutResult[Success, Error]:
+) -> RegionalFanoutResult[Success]:
     """Execute one worker per region with bounded concurrency.
 
-    The utility owns execution mechanics only. Callers decide how to create clients,
-    format errors, and interpret regional outcomes.
+    The utility owns execution mechanics and standard AWS error formatting. Callers
+    decide how to create clients and interpret regional outcomes.
 
     Args:
         requests: Region keys mapped to caller-defined request state.
         worker: Async callable that executes one regional request.
-        format_error: Async callable that turns an exception into a caller-defined error.
+        ctx: The MCP context object.
+        operation: The AWS operation being performed.
+        service_name: The user-facing AWS service name.
         max_concurrency: Maximum number of regional workers running concurrently.
 
     Returns:
@@ -101,13 +104,15 @@ async def fan_out_regions(
 
     async def query_region(
         region: str, request_state: RequestState
-    ) -> Tuple[str, Optional[Success], Optional[Error]]:
+    ) -> Tuple[str, Optional[Success], Optional[Dict[str, Any]]]:
         async with semaphore:
             try:
                 value = await worker(region, request_state)
                 return region, value, None
             except Exception as error:
-                formatted_error = await format_error(region, error)
+                formatted_error = await format_regional_aws_error(
+                    ctx, error, operation, service_name
+                )
                 return region, None, formatted_error
 
     outcomes = await asyncio.gather(
@@ -115,7 +120,7 @@ async def fan_out_regions(
     )
 
     successes: Dict[str, Success] = {}
-    errors: Dict[str, Error] = {}
+    errors: Dict[str, Dict[str, Any]] = {}
     for region, value, error in outcomes:
         if error is not None:
             errors[region] = error
@@ -138,14 +143,12 @@ async def collect_regional_pages(
     max_concurrency: int,
 ) -> RegionalPageResult:
     """Execute regional list workers and merge their items and pagination state."""
-
-    async def format_error(region: str, error: Exception) -> Dict[str, Any]:
-        return await format_regional_aws_error(ctx, error, operation, service_name)
-
     outcomes = await fan_out_regions(
         requests,
         worker,
-        format_error,
+        ctx=ctx,
+        operation=operation,
+        service_name=service_name,
         max_concurrency=max_concurrency,
     )
 
