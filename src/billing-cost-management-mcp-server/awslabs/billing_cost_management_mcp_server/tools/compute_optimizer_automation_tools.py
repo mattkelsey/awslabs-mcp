@@ -593,13 +593,21 @@ async def dispatch_global(
     )
 
 
-def _is_resource_not_found(error: Exception) -> bool:
-    """Return True for a Compute Optimizer Automation not-found error."""
-    response = getattr(error, 'response', None)
-    if isinstance(response, dict):
-        if response.get('Error', {}).get('Code') == 'ResourceNotFoundException':
-            return True
-    return type(error).__name__ == 'ResourceNotFoundException'
+def _partition_resource_not_found_errors(
+    region_errors: Dict[str, Dict[str, Any]],
+) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """Separate not-found outcomes from other regional errors."""
+    regions_not_found = [
+        region
+        for region, error in region_errors.items()
+        if error.get('error_type') == 'ResourceNotFoundException'
+    ]
+    other_errors = {
+        region: error
+        for region, error in region_errors.items()
+        if error.get('error_type') != 'ResourceNotFoundException'
+    }
+    return other_errors, regions_not_found
 
 
 async def _run_global_list(
@@ -625,37 +633,41 @@ async def _run_global_list(
         operation=operation,
         service_name=_SERVICE_NAME,
         max_concurrency=_MAX_CONCURRENT_REGIONS,
-        is_miss=_is_resource_not_found if not_found_is_empty else None,
     )
 
+    region_errors = outcomes.errors
+    regions_not_found: List[str] = []
+    if not_found_is_empty:
+        region_errors, regions_not_found = _partition_resource_not_found_errors(region_errors)
+
     successful_regions = len(outcomes.successful_regions)
-    if not_found_is_empty and outcomes.misses and not outcomes.errors and not successful_regions:
+    if not_found_is_empty and regions_not_found and not region_errors and not successful_regions:
         return format_response(
             'error',
             {
                 'operation': operation,
                 'regions_queried': list(regions_tokens),
-                'regions_not_found': outcomes.misses,
+                'regions_not_found': regions_not_found,
             },
-            f'The requested resource was not found in any of the {len(outcomes.misses)} '
+            f'The requested resource was not found in any of the {len(regions_not_found)} '
             f'region(s) queried for {operation}.',
         )
 
-    if outcomes.errors and not successful_regions:
+    if region_errors and not successful_regions:
         data: Dict[str, Any] = {
             'operation': operation,
             'regions_queried': list(regions_tokens),
-            'region_errors': outcomes.errors,
+            'region_errors': region_errors,
         }
-        if outcomes.misses:
-            data['regions_not_found'] = outcomes.misses
+        if regions_not_found:
+            data['regions_not_found'] = regions_not_found
             message = (
                 f'Could not determine whether the requested resource exists for {operation}: '
-                f'{len(outcomes.errors)} region(s) failed and {len(outcomes.misses)} returned '
+                f'{len(region_errors)} region(s) failed and {len(regions_not_found)} returned '
                 'not found.'
             )
         else:
-            message = f'All {len(outcomes.errors)} region(s) failed for {operation}.'
+            message = f'All {len(region_errors)} region(s) failed for {operation}.'
         return format_response('error', data, message)
 
     return await _finalize_global_list_response(
@@ -665,7 +677,7 @@ async def _run_global_list(
         outcomes.items,
         list(regions_tokens),
         outcomes.next_tokens,
-        outcomes.errors,
+        region_errors,
     )
 
 
@@ -723,7 +735,6 @@ async def _get_automation_event_global(ctx: Context, event_id: str) -> Dict[str,
         worker,
         format_error,
         max_concurrency=_MAX_CONCURRENT_REGIONS,
-        is_miss=_is_resource_not_found,
     )
 
     for region, response in outcomes.successes.items():
@@ -740,14 +751,15 @@ async def _get_automation_event_global(ctx: Context, event_id: str) -> Dict[str,
         'event_id': event_id,
         'regions_queried': list(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS),
     }
-    if outcomes.errors:
-        data['region_errors'] = outcomes.errors
-        data['regions_not_found'] = outcomes.misses
+    region_errors, regions_not_found = _partition_resource_not_found_errors(outcomes.errors)
+    if region_errors:
+        data['region_errors'] = region_errors
+        data['regions_not_found'] = regions_not_found
         return format_response(
             'error',
             data,
             f'Could not determine whether automation event {event_id} exists because '
-            f'{len(outcomes.errors)} of {len(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS)} region(s) '
+            f'{len(region_errors)} of {len(COMPUTE_OPTIMIZER_AUTOMATION_REGIONS)} region(s) '
             'could not be searched. Review region_errors and retry.',
         )
     return format_response(

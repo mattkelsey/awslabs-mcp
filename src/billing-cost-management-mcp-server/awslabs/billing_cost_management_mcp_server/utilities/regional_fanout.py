@@ -48,7 +48,6 @@ class RegionalFanoutResult(Generic[Success, Error]):
 
     successes: Dict[str, Success]
     errors: Dict[str, Error]
-    misses: List[str]
 
 
 @dataclass
@@ -58,7 +57,6 @@ class RegionalPageResult:
     items: List[Dict[str, Any]]
     next_tokens: Dict[str, str]
     errors: Dict[str, Dict[str, Any]]
-    misses: List[str]
     successful_regions: List[str]
 
 
@@ -78,22 +76,20 @@ async def fan_out_regions(
     format_error: Callable[[str, Exception], Awaitable[Error]],
     *,
     max_concurrency: int,
-    is_miss: Optional[Callable[[Exception], bool]] = None,
 ) -> RegionalFanoutResult[Success, Error]:
     """Execute one worker per region with bounded concurrency.
 
     The utility owns execution mechanics only. Callers decide how to create clients,
-    classify misses, format errors, and merge successful values.
+    format errors, and interpret regional outcomes.
 
     Args:
         requests: Region keys mapped to caller-defined request state.
         worker: Async callable that executes one regional request.
         format_error: Async callable that turns an exception into a caller-defined error.
         max_concurrency: Maximum number of regional workers running concurrently.
-        is_miss: Optional exception classifier for expected regional misses.
 
     Returns:
-        Regional successes, errors, and misses, each preserving request order.
+        Regional successes and errors, each preserving request order.
 
     Raises:
         ValueError: If max_concurrency is less than one.
@@ -105,16 +101,14 @@ async def fan_out_regions(
 
     async def query_region(
         region: str, request_state: RequestState
-    ) -> Tuple[str, Optional[Success], Optional[Error], bool]:
+    ) -> Tuple[str, Optional[Success], Optional[Error]]:
         async with semaphore:
             try:
                 value = await worker(region, request_state)
-                return region, value, None, False
+                return region, value, None
             except Exception as error:
-                if is_miss is not None and is_miss(error):
-                    return region, None, None, True
                 formatted_error = await format_error(region, error)
-                return region, None, formatted_error, False
+                return region, None, formatted_error
 
     outcomes = await asyncio.gather(
         *(query_region(region, state) for region, state in requests.items())
@@ -122,16 +116,13 @@ async def fan_out_regions(
 
     successes: Dict[str, Success] = {}
     errors: Dict[str, Error] = {}
-    misses: List[str] = []
-    for region, value, error, missed in outcomes:
-        if missed:
-            misses.append(region)
-        elif error is not None:
+    for region, value, error in outcomes:
+        if error is not None:
             errors[region] = error
         else:
             successes[region] = cast(Success, value)
 
-    return RegionalFanoutResult(successes=successes, errors=errors, misses=misses)
+    return RegionalFanoutResult(successes=successes, errors=errors)
 
 
 async def collect_regional_pages(
@@ -145,7 +136,6 @@ async def collect_regional_pages(
     operation: str,
     service_name: str,
     max_concurrency: int,
-    is_miss: Optional[Callable[[Exception], bool]] = None,
 ) -> RegionalPageResult:
     """Execute regional list workers and merge their items and pagination state."""
 
@@ -157,7 +147,6 @@ async def collect_regional_pages(
         worker,
         format_error,
         max_concurrency=max_concurrency,
-        is_miss=is_miss,
     )
 
     items: List[Dict[str, Any]] = []
@@ -173,7 +162,6 @@ async def collect_regional_pages(
         items=items,
         next_tokens=next_tokens,
         errors=outcomes.errors,
-        misses=outcomes.misses,
         successful_regions=list(outcomes.successes),
     )
 

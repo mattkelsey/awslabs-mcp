@@ -1155,14 +1155,19 @@ _NOT_FOUND = ClientError(
 )
 
 
-def test_resource_not_found_classifier_rejects_other_client_errors():
-    """A ClientError response with another code is not classified as not-found."""
-    access_denied = ClientError(
-        {'Error': {'Code': 'AccessDeniedException', 'Message': 'denied'}},
-        'GetAutomationEvent',
+def test_partition_resource_not_found_errors():
+    """The caller separates not-found outcomes while preserving other errors."""
+    other_errors, regions_not_found = automation_tools._partition_resource_not_found_errors(
+        {
+            'us-east-1': {'error_type': 'ResourceNotFoundException'},
+            'us-west-2': {'error_type': 'AccessDeniedException', 'message': 'denied'},
+        }
     )
 
-    assert automation_tools._is_resource_not_found(access_denied) is False
+    assert regions_not_found == ['us-east-1']
+    assert other_errors == {
+        'us-west-2': {'error_type': 'AccessDeniedException', 'message': 'denied'}
+    }
 
 
 def _list_factory(method, list_key, region_pages, errors=()):

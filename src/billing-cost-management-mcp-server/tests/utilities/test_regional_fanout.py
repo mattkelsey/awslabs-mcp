@@ -22,11 +22,12 @@ from awslabs.billing_cost_management_mcp_server.utilities.regional_fanout import
     encode_regional_next_token,
     fan_out_regions,
 )
+from botocore.exceptions import ClientError
 from unittest.mock import AsyncMock, MagicMock
 
 
 async def test_fan_out_regions_collects_ordered_outcomes():
-    """Successes, errors, and misses preserve the caller's region order."""
+    """Successes and errors preserve the caller's region order."""
 
     async def worker(region, state):
         if state == 'miss':
@@ -43,12 +44,13 @@ async def test_fan_out_regions_collects_ordered_outcomes():
         worker,
         format_error,
         max_concurrency=2,
-        is_miss=lambda error: isinstance(error, LookupError),
     )
 
     assert result.successes == {'us-east-1': 'OK'}
-    assert result.misses == ['us-west-2']
-    assert result.errors == {'eu-west-1': {'region': 'eu-west-1', 'message': 'eu-west-1'}}
+    assert result.errors == {
+        'us-west-2': {'region': 'us-west-2', 'message': 'us-west-2'},
+        'eu-west-1': {'region': 'eu-west-1', 'message': 'eu-west-1'},
+    }
 
 
 async def test_fan_out_regions_rejects_invalid_concurrency():
@@ -70,13 +72,16 @@ async def test_fan_out_regions_rejects_invalid_concurrency():
 
 
 async def test_collect_regional_pages_merges_items_tokens_and_outcomes():
-    """Regional pages are merged, stamped, and retain errors and misses."""
+    """Regional pages are merged, stamped, and retain every regional error."""
     ctx = MagicMock()
     ctx.error = AsyncMock()
 
     async def worker(region, state):
-        if state == 'miss':
-            raise LookupError(region)
+        if state == 'not_found':
+            raise ClientError(
+                {'Error': {'Code': 'ResourceNotFoundException', 'Message': region}},
+                'ListResources',
+            )
         if state == 'error':
             raise RuntimeError(region)
         if state == 'more':
@@ -87,7 +92,7 @@ async def test_collect_regional_pages_merges_items_tokens_and_outcomes():
         {
             'us-east-1': 'more',
             'us-west-2': 'done',
-            'eu-west-1': 'miss',
+            'eu-west-1': 'not_found',
             'ap-south-1': 'error',
         },
         worker,
@@ -95,7 +100,6 @@ async def test_collect_regional_pages_merges_items_tokens_and_outcomes():
         operation='list_resources',
         service_name='Test Service',
         max_concurrency=2,
-        is_miss=lambda error: isinstance(error, LookupError),
     )
 
     assert result.items == [
@@ -104,7 +108,7 @@ async def test_collect_regional_pages_merges_items_tokens_and_outcomes():
     ]
     assert result.next_tokens == {'us-east-1': 'service-token'}
     assert result.successful_regions == ['us-east-1', 'us-west-2']
-    assert result.misses == ['eu-west-1']
+    assert result.errors['eu-west-1']['error_type'] == 'ResourceNotFoundException'
     assert result.errors['ap-south-1']['error_type'] == 'unknown_runtimeerror'
     assert result.errors['ap-south-1']['message'] == 'ap-south-1'
 
